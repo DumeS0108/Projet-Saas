@@ -1,15 +1,25 @@
-import { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { useReactToPrint } from "react-to-print";
 
 const API_BASE = "http://127.0.0.1:8000";
 
 function App() {
+  // --- État d'authentification ---
+  const [token, setToken] = useState(() => localStorage.getItem("token"));
+
+  // --- États du formulaire de connexion/inscription ---
+  const [authMode, setAuthMode] = useState("login"); // "login" | "register"
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+
   // --- États liés à l'upload en cours ---
   const [selectedFile, setSelectedFile] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // --- États liés à l'affichage du rapport (upload OU historique) ---
+  // --- États liés à l'affichage du rapport ---
   const [result, setResult] = useState(null);
   const [selectedScanId, setSelectedScanId] = useState(null);
 
@@ -26,35 +36,132 @@ function App() {
       : "rapport-scan",
   });
 
-  // --- Chargement de l'historique ---
-  // Correction ESLint : On ne force plus le chargement à true ici, 
-  // on le fait uniquement quand c'est nécessaire.
+  // ============================================================
+  // --- Utilitaire : fetch authentifié ---
+  // ============================================================
+  const authFetch = async (url, options = {}) => {
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        ...options.headers,
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    if (response.status === 401) {
+      handleLogout();
+      throw new Error("Session expirée, merci de vous reconnecter.");
+    }
+
+    return response;
+  };
+
+  // ============================================================
+  // --- Authentification ---
+  // ============================================================
+
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    setAuthError(null);
+    setIsAuthLoading(true);
+
+    try {
+      let response;
+
+      if (authMode === "register") {
+        response = await fetch(`${API_BASE}/api/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: authUsername, password: authPassword }),
+        });
+      } else {
+        const formBody = new URLSearchParams();
+        formBody.append("username", authUsername);
+        formBody.append("password", authPassword);
+
+        response = await fetch(`${API_BASE}/api/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: formBody,
+        });
+      }
+
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.detail || "Identifiants invalides.");
+      }
+
+      const data = await response.json();
+
+      localStorage.setItem("token", data.access_token);
+      setToken(data.access_token);
+      setAuthUsername("");
+      setAuthPassword("");
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("token");
+    setToken(null);
+    setResult(null);
+    setScansHistory([]);
+    setSelectedScanId(null);
+  };
+
+  // ============================================================
+  // --- Chargement de l'historique au montage (si déjà connecté) ---
+  // ============================================================
+  useEffect(() => {
+    if (!token) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsHistoryLoading(false);
+      return;
+    }
+
+    let ignore = false;
+
+    const loadInitialHistory = async () => {
+      try {
+        const response = await authFetch(`${API_BASE}/api/scans`);
+        if (!response.ok) throw new Error("Impossible de charger l'historique.");
+        const data = await response.json();
+        if (!ignore) setScansHistory(data);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        if (!ignore) setIsHistoryLoading(false);
+      }
+    };
+
+    loadInitialHistory();
+
+    return () => {
+      ignore = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
   const fetchScansHistory = async () => {
     try {
-      const response = await fetch(`${API_BASE}/api/scans`);
+      const response = await authFetch(`${API_BASE}/api/scans`);
       if (!response.ok) throw new Error("Impossible de charger l'historique.");
       const data = await response.json();
       setScansHistory(data);
     } catch (err) {
       console.error(err);
-    } finally {
-      setIsHistoryLoading(false);
     }
   };
 
-  // Appel au montage du composant
-  useEffect(() => {
-  // eslint-disable-next-line react-hooks/set-state-in-effect
-    fetchScansHistory();
-  }, []);
-
-  // --- Récupération d'un ancien scan au clic dans la sidebar ---
   const fetchScanDetail = async (scanId) => {
     setError(null);
     setSelectedScanId(scanId);
 
     try {
-      const response = await fetch(`${API_BASE}/api/scans/${scanId}`);
+      const response = await authFetch(`${API_BASE}/api/scans/${scanId}`);
 
       if (!response.ok) {
         const errData = await response.json();
@@ -90,7 +197,7 @@ function App() {
     formData.append("file", selectedFile);
 
     try {
-      const response = await fetch(`${API_BASE}/api/upload-scan`, {
+      const response = await authFetch(`${API_BASE}/api/upload-scan`, {
         method: "POST",
         body: formData,
       });
@@ -103,10 +210,6 @@ function App() {
       const data = await response.json();
       setResult(data);
       setSelectedScanId(data.scan_id);
-
-      // Correction ESLint : On active le logo de chargement manuellement 
-      // juste avant de rafraîchir l'historique
-      setIsHistoryLoading(true);
       fetchScansHistory();
     } catch (err) {
       setError(err.message);
@@ -127,19 +230,114 @@ function App() {
     });
   };
 
+  // Retourne les classes Tailwind adaptées au niveau de sévérité CVSS d'une CVE
+  const getSeverityStyle = (severity) => {
+    switch (severity) {
+      case "CRITICAL":
+        return "bg-red-700 text-white";
+      case "HIGH":
+        return "bg-red-100 text-red-700";
+      case "MEDIUM":
+        return "bg-orange-100 text-orange-700";
+      case "LOW":
+        return "bg-yellow-100 text-yellow-700";
+      default:
+        return "bg-slate-100 text-slate-500";
+    }
+  };
+
+  // ============================================================
+  // --- Écran de connexion / inscription (si pas de token) ---
+  // ============================================================
+  if (!token) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="w-full max-w-sm bg-white rounded-xl shadow-sm border border-slate-200 p-8">
+          <h1 className="text-xl font-semibold text-slate-900 mb-1 text-center">
+            Network Report
+          </h1>
+          <p className="text-sm text-slate-500 mb-6 text-center">
+            {authMode === "login" ? "Connectez-vous à votre compte" : "Créez votre compte"}
+          </p>
+
+          <form onSubmit={handleAuthSubmit} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">
+                Nom d'utilisateur
+              </label>
+              <input
+                type="text"
+                value={authUsername}
+                onChange={(e) => setAuthUsername(e.target.value)}
+                required
+                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm
+                           focus:outline-none focus:ring-2 focus:ring-slate-900"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">
+                Mot de passe
+              </label>
+              <input
+                type="password"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                required
+                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm
+                           focus:outline-none focus:ring-2 focus:ring-slate-900"
+              />
+            </div>
+
+            {authError && (
+              <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-3 py-2 text-sm">
+                {authError}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={isAuthLoading}
+              className="w-full bg-slate-900 text-white text-sm font-medium py-2.5
+                         rounded-lg hover:bg-slate-800 transition-colors
+                         disabled:bg-slate-300 disabled:cursor-not-allowed"
+            >
+              {isAuthLoading
+                ? "Veuillez patienter..."
+                : authMode === "login" ? "Se connecter" : "Créer mon compte"}
+            </button>
+          </form>
+
+          <button
+            onClick={() => {
+              setAuthMode(authMode === "login" ? "register" : "login");
+              setAuthError(null);
+            }}
+            className="w-full text-center text-sm text-slate-500 hover:text-slate-700 mt-4"
+          >
+            {authMode === "login"
+              ? "Pas encore de compte ? Créer un compte"
+              : "Déjà un compte ? Se connecter"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ============================================================
+  // --- Dashboard principal (si connecté) ---
+  // ============================================================
   return (
     <div className="flex min-h-screen bg-slate-50">
-      {/* ============================= */}
-      {/* --- SIDEBAR : historique --- */}
-      {/* ============================= */}
-      <aside className="w-72 bg-slate-900 text-slate-300 shrink-0 print:hidden">
+      {/* --- SIDEBAR --- */}
+      <aside className="w-72 bg-slate-900 text-slate-300 flex-shrink-0 print:hidden flex flex-col">
         <div className="p-5 border-b border-slate-800">
           <h2 className="text-white font-semibold text-sm tracking-wide">
             Historique des scans
           </h2>
         </div>
 
-        <div className="overflow-y-auto max-h-[calc(100vh-64px)]">
+        <div className="overflow-y-auto flex-1">
           {isHistoryLoading && (
             <p className="text-slate-500 text-sm px-5 py-4">Chargement...</p>
           )}
@@ -173,11 +371,20 @@ function App() {
             ))}
           </ul>
         </div>
+
+        <div className="p-4 border-t border-slate-800">
+          <button
+            onClick={handleLogout}
+            className="w-full text-sm text-slate-400 hover:text-white
+                       border border-slate-700 hover:border-slate-500
+                       rounded-lg py-2 transition-colors"
+          >
+            Se déconnecter
+          </button>
+        </div>
       </aside>
 
-      {/* ============================= */}
       {/* --- ZONE PRINCIPALE --- */}
-      {/* ============================= */}
       <main className="flex-1 py-10 px-6">
         <div className="max-w-4xl mx-auto" ref={reportRef}>
           <header className="mb-8 print:hidden">
@@ -189,7 +396,6 @@ function App() {
             </p>
           </header>
 
-          {/* --- Zone d'upload --- */}
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mb-6 print:hidden">
             <label className="block text-sm font-medium text-slate-700 mb-2">
               Fichier de scan Nmap
@@ -214,6 +420,12 @@ function App() {
                 {isLoading ? "Analyse en cours..." : "Analyser"}
               </button>
             </div>
+            {isLoading && (
+              <p className="text-xs text-slate-400 mt-2">
+                L'analyse peut prendre plusieurs dizaines de secondes : chaque service détecté
+                est vérifié auprès de la base de vulnérabilités NVD.
+              </p>
+            )}
           </div>
 
           {isLoading && (
@@ -241,7 +453,6 @@ function App() {
             </div>
           )}
 
-          {/* --- Cartes hosts --- */}
           {result && (
             <div className="space-y-4">
               <p className="text-sm text-slate-500">
@@ -307,14 +518,44 @@ function App() {
                       </thead>
                       <tbody>
                         {host.open_ports.map((port, idx) => (
-                          <tr key={idx} className="border-b border-slate-50 last:border-0">
-                            <td className="py-2 text-slate-700 font-medium">{port.port}</td>
-                            <td className="py-2 text-slate-500">{port.protocol}</td>
-                            <td className="py-2 text-slate-500">{port.service}</td>
-                            <td className="py-2 text-slate-500">
-                              {port.product} {port.version}
-                            </td>
-                          </tr>
+                          // Fragment nécessaire car on rend potentiellement 2 <tr>
+                          // par port : la ligne d'info + la ligne d'alerte CVE
+                          <React.Fragment key={idx}>
+                            <tr className="border-b border-slate-50 last:border-0">
+                              <td className="py-2 text-slate-700 font-medium">{port.port}</td>
+                              <td className="py-2 text-slate-500">{port.protocol}</td>
+                              <td className="py-2 text-slate-500">{port.service}</td>
+                              <td className="py-2 text-slate-500">
+                                {port.product} {port.version}
+                              </td>
+                            </tr>
+
+                            {/* --- Sous-ligne d'alerte, uniquement si des CVE existent --- */}
+                            {port.cves && port.cves.length > 0 && (
+                              <tr className="bg-red-50">
+                                <td colSpan={4} className="px-2 py-2">
+                                  <div className="flex items-start gap-2">
+                                    <span className="text-xs font-semibold text-red-700 whitespace-nowrap mt-0.5">
+                                      ⚠️ Vulnérabilités détectées
+                                    </span>
+                                    <div className="flex flex-wrap gap-1.5">
+                                      {port.cves.map((cve) => (
+                                        <span
+                                          key={cve.id}
+                                          title={cve.summary}
+                                          className={`text-xs font-medium px-2 py-0.5 rounded-full cursor-help ${getSeverityStyle(
+                                            cve.severity
+                                          )}`}
+                                        >
+                                          {cve.id} · {cve.severity}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
                         ))}
                       </tbody>
                     </table>
