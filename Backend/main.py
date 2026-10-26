@@ -1,5 +1,3 @@
-# main.py
-
 import os
 import json
 import uuid
@@ -11,29 +9,26 @@ from sqlalchemy.orm import Session
 
 from nmap_parser import parse_nmap_xml
 from cve_engine import search_cve
+from remediation_engine import get_remediations
 from database import engine, get_db, Base
 import models
 import auth
 
-
-# --- Création des tables au démarrage ---
 Base.metadata.create_all(bind=engine)
-
 
 app = FastAPI(title="Network Report SaaS API")
 
-
-origins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-]
-
+# --- CONFIGURATION CORS UNIQUE ET PROPRE ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173",
+        "http://192.168.1.174:5173" # Ajout de ton IP réseau
+    ], 
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], 
+    allow_headers=["*"], 
 )
 
 
@@ -42,7 +37,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 # ============================================================
-# --- Schémas Pydantic pour l'authentification ---
+# --- Schémas Pydantic ---
 # ============================================================
 
 class UserCreate(BaseModel):
@@ -61,9 +56,6 @@ class Token(BaseModel):
 
 @app.post("/api/register", response_model=Token)
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
-    """Crée un nouveau compte utilisateur et retourne directement un token,
-    pour éviter à l'utilisateur de devoir se reconnecter juste après."""
-
     existing_user = db.query(models.User).filter(
         models.User.username == user_data.username
     ).first()
@@ -84,11 +76,6 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/api/login", response_model=Token)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    """
-    Vérifie les identifiants et retourne un token JWT.
-    Utilise OAuth2PasswordRequestForm (form-data username/password),
-    format standard attendu par le bouton "Authorize" de Swagger.
-    """
     user = db.query(models.User).filter(
         models.User.username == form_data.username
     ).first()
@@ -115,13 +102,8 @@ async def upload_scan(
     current_user: models.User = Depends(auth.get_current_user),
 ):
     """
-    Reçoit un fichier XML Nmap, le parse, enrichit chaque port avec les CVE
-    connues (produit + version), sauvegarde le tout en base rattaché à
-    l'utilisateur connecté, et retourne le JSON enrichi.
-
-    NOTE : cette route peut être lente (plusieurs secondes par port avec
-    produit+version détectés), à cause du rate limit imposé par l'API NVD
-    sans clé (5 requêtes / 30s). C'est un compromis assumé pour ce MVP.
+    Parse le XML, enrichit chaque port avec les CVE connues, calcule les
+    remédiations par host, sauvegarde le tout en base, et retourne le JSON complet.
     """
 
     if not file.filename.endswith(".xml"):
@@ -143,24 +125,22 @@ async def upload_scan(
                 detail="Aucun host valide trouvé dans le fichier XML fourni."
             )
 
-        # --- Sauvegarde en base, rattachée à current_user ---
         new_scan = models.Scan(filename=file.filename, user_id=current_user.id)
         db.add(new_scan)
-        db.flush()  # pour obtenir new_scan.id avant l'insertion des hosts
+        db.flush()
 
-        enriched_hosts = []  # version enrichie (avec CVE) pour la réponse HTTP
+        enriched_hosts = []
 
         for host_data in parsed_data:
-            # --- Enrichissement CVE : on boucle sur chaque port ouvert ---
             enriched_ports = []
             for port in host_data["open_ports"]:
                 product = port.get("product")
                 version = port.get("version")
-
-                # On n'appelle l'API NVD que si on a les deux infos nécessaires
                 cves = search_cve(product, version) if product and version else []
-
                 enriched_ports.append({**port, "cves": cves})
+
+            # --- Remédiations calculées à partir des ports enrichis ---
+            remediations = get_remediations(enriched_ports)
 
             new_host = models.Host(
                 scan_id=new_scan.id,
@@ -170,11 +150,15 @@ async def upload_scan(
                 vendor=host_data["vendor"],
                 hostname=host_data["hostname"],
                 os=host_data["os"],
-                open_ports=json.dumps(enriched_ports),  # version enrichie sauvegardée en base
+                open_ports=json.dumps(enriched_ports),
             )
             db.add(new_host)
 
-            enriched_hosts.append({**host_data, "open_ports": enriched_ports})
+            enriched_hosts.append({
+                **host_data,
+                "open_ports": enriched_ports,
+                "remediations": remediations,
+            })
 
         db.commit()
         db.refresh(new_scan)
@@ -203,10 +187,6 @@ def list_scans(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    """
-    Retourne l'historique des scans de l'utilisateur connecté uniquement,
-    avec le nombre d'hosts associés à chacun.
-    """
     scans = (
         db.query(models.Scan)
         .filter(models.Scan.user_id == current_user.id)
@@ -232,9 +212,9 @@ def get_scan_detail(
     current_user: models.User = Depends(auth.get_current_user),
 ):
     """
-    Retourne le détail complet d'un scan passé (avec les CVE déjà enregistrées
-    en base, donc aucun nouvel appel réseau NVD ici), uniquement s'il
-    appartient à l'utilisateur connecté (protection contre l'IDOR).
+    Retourne le détail complet d'un scan, avec CVE (stockées en base) et
+    remédiations (recalculées à la volée à partir des ports, pour toujours
+    refléter la version la plus à jour des règles de sécurité).
     """
     scan = (
         db.query(models.Scan)
@@ -248,20 +228,19 @@ def get_scan_detail(
             detail=f"Aucun scan trouvé avec l'ID {scan_id}."
         )
 
-    hosts = [
-        {
+    hosts = []
+    for host in scan.hosts:
+        open_ports = json.loads(host.open_ports) if host.open_ports else []
+        hosts.append({
             "ip": host.ip,
             "status": host.status,
             "mac_address": host.mac_address,
             "vendor": host.vendor,
             "hostname": host.hostname,
             "os": host.os,
-            # open_ports contient déjà la clé "cves" par port,
-            # puisqu'elle a été ajoutée avant le json.dumps() à l'upload
-            "open_ports": json.loads(host.open_ports) if host.open_ports else [],
-        }
-        for host in scan.hosts
-    ]
+            "open_ports": open_ports,
+            "remediations": get_remediations(open_ports),
+        })
 
     return {
         "scan_id": scan.id,

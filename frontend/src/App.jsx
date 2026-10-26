@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect } from "react";
 import { useReactToPrint } from "react-to-print";
+import ScanStats from "./ScanStats";
+import ScanCompare from "./ScanCompare";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
 function App() {
   // --- État d'authentification ---
@@ -26,6 +28,13 @@ function App() {
   // --- État de la sidebar ---
   const [scansHistory, setScansHistory] = useState([]);
   const [isHistoryLoading, setIsHistoryLoading] = useState(true);
+
+  // --- États du comparateur de scans ---
+  const [compareMode, setCompareMode] = useState(false);
+  const [compareSelection, setCompareSelection] = useState([]); // max 2 IDs de scan
+  const [compareData, setCompareData] = useState(null); // { scanA, scanB }
+  const [isCompareLoading, setIsCompareLoading] = useState(false);
+  const [compareError, setCompareError] = useState(null);
 
   const reportRef = useRef(null);
 
@@ -247,6 +256,72 @@ function App() {
   };
 
   // ============================================================
+  // --- Comparateur : sélection et récupération des scans ---
+  // ============================================================
+
+  // Sélection/désélection d'un scan pour la comparaison (max 2)
+  const toggleCompareSelection = (scanId) => {
+    setCompareData(null); // on invalide un ancien résultat de comparaison
+    setCompareError(null);
+
+    setCompareSelection((prev) => {
+      if (prev.includes(scanId)) {
+        return prev.filter((id) => id !== scanId);
+      }
+      if (prev.length >= 2) {
+        return prev; // déjà 2 sélectionnés, on ignore un 3e clic
+      }
+      return [...prev, scanId];
+    });
+  };
+
+  // Récupération automatique des 2 scans dès que la sélection est complète
+  useEffect(() => {
+    if (compareSelection.length !== 2) return;
+
+    let ignore = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setIsCompareLoading(true);
+    setCompareError(null);
+
+    const loadBothScans = async () => {
+      try {
+        const [resA, resB] = await Promise.all([
+          authFetch(`${API_BASE}/api/scans/${compareSelection[0]}`),
+          authFetch(`${API_BASE}/api/scans/${compareSelection[1]}`),
+        ]);
+
+        if (!resA.ok || !resB.ok) {
+          throw new Error("Impossible de charger l'un des deux scans à comparer.");
+        }
+
+        const scanA = await resA.json();
+        const scanB = await resB.json();
+
+        if (!ignore) setCompareData({ scanA, scanB });
+      } catch (err) {
+        if (!ignore) setCompareError(err.message);
+      } finally {
+        if (!ignore) setIsCompareLoading(false);
+      }
+    };
+
+    loadBothScans();
+
+    return () => {
+      ignore = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compareSelection]);
+
+  const exitCompareMode = () => {
+    setCompareMode(false);
+    setCompareSelection([]);
+    setCompareData(null);
+    setCompareError(null);
+  };
+
+  // ============================================================
   // --- Écran de connexion / inscription (si pas de token) ---
   // ============================================================
   if (!token) {
@@ -332,9 +407,32 @@ function App() {
       {/* --- SIDEBAR --- */}
       <aside className="w-72 bg-slate-900 text-slate-300 flex-shrink-0 print:hidden flex flex-col">
         <div className="p-5 border-b border-slate-800">
-          <h2 className="text-white font-semibold text-sm tracking-wide">
-            Historique des scans
-          </h2>
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-white font-semibold text-sm tracking-wide">
+              Historique des scans
+            </h2>
+          </div>
+          <button
+            onClick={() => {
+              if (compareMode) {
+                exitCompareMode();
+              } else {
+                setCompareMode(true);
+              }
+            }}
+            className={`w-full text-xs font-medium py-1.5 rounded-lg transition-colors ${
+              compareMode
+                ? "bg-emerald-600 text-white hover:bg-emerald-700"
+                : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+            }`}
+          >
+            {compareMode ? "Quitter la comparaison" : "Comparer avec un autre scan"}
+          </button>
+          {compareMode && (
+            <p className="text-xs text-slate-500 mt-2">
+              Sélectionnez 2 scans ({compareSelection.length}/2)
+            </p>
+          )}
         </div>
 
         <div className="overflow-y-auto flex-1">
@@ -351,22 +449,51 @@ function App() {
           <ul>
             {scansHistory.map((scan) => (
               <li key={scan.id}>
-                <button
-                  onClick={() => fetchScanDetail(scan.id)}
-                  className={`w-full text-left px-5 py-3 border-l-2 transition-colors ${
-                    selectedScanId === scan.id
-                      ? "bg-slate-800 border-emerald-400 text-white"
-                      : "border-transparent hover:bg-slate-800/60 hover:border-slate-600"
-                  }`}
-                >
-                  <p className="text-sm font-medium truncate">{scan.filename}</p>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    {formatDate(scan.date_creation)}
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    {scan.hosts_count} hôte(s)
-                  </p>
-                </button>
+                {compareMode ? (
+                  <label
+                    className={`w-full text-left px-5 py-3 border-l-2 flex items-start gap-3 cursor-pointer transition-colors ${
+                      compareSelection.includes(scan.id)
+                        ? "bg-slate-800 border-emerald-400"
+                        : "border-transparent hover:bg-slate-800/60"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={compareSelection.includes(scan.id)}
+                      onChange={() => toggleCompareSelection(scan.id)}
+                      disabled={
+                        !compareSelection.includes(scan.id) && compareSelection.length >= 2
+                      }
+                      className="mt-1"
+                    />
+                    <div>
+                      <p className="text-sm font-medium truncate">{scan.filename}</p>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        {formatDate(scan.date_creation)}
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        {scan.hosts_count} hôte(s)
+                      </p>
+                    </div>
+                  </label>
+                ) : (
+                  <button
+                    onClick={() => fetchScanDetail(scan.id)}
+                    className={`w-full text-left px-5 py-3 border-l-2 transition-colors ${
+                      selectedScanId === scan.id
+                        ? "bg-slate-800 border-emerald-400 text-white"
+                        : "border-transparent hover:bg-slate-800/60 hover:border-slate-600"
+                    }`}
+                  >
+                    <p className="text-sm font-medium truncate">{scan.filename}</p>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      {formatDate(scan.date_creation)}
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      {scan.hosts_count} hôte(s)
+                    </p>
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -440,7 +567,7 @@ function App() {
             </div>
           )}
 
-          {result && (
+          {result && !compareMode && (
             <div className="flex justify-end mb-4 print:hidden">
               <button
                 onClick={handlePrint}
@@ -453,7 +580,31 @@ function App() {
             </div>
           )}
 
-          {result && (
+          {/* --- Comparateur : prioritaire sur l'affichage normal quand actif --- */}
+          {compareMode && isCompareLoading && (
+            <div className="text-center text-slate-500 py-10 print:hidden">
+              Chargement des deux scans à comparer...
+            </div>
+          )}
+
+          {compareMode && compareError && (
+            <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 mb-6 text-sm print:hidden">
+              {compareError}
+            </div>
+          )}
+
+          {compareMode && compareData && (
+            <ScanCompare
+              scanA={compareData.scanA}
+              scanB={compareData.scanB}
+              onClose={exitCompareMode}
+            />
+          )}
+
+          {/* --- Graphiques (OS + top ports), affichés uniquement hors comparaison --- */}
+          {!compareMode && result && <ScanStats hosts={result.hosts} />}
+
+          {!compareMode && result && (
             <div className="space-y-4">
               <p className="text-sm text-slate-500">
                 {result.hosts_count} hôte(s) trouvé(s) dans « {result.filename} »
@@ -518,8 +669,6 @@ function App() {
                       </thead>
                       <tbody>
                         {host.open_ports.map((port, idx) => (
-                          // Fragment nécessaire car on rend potentiellement 2 <tr>
-                          // par port : la ligne d'info + la ligne d'alerte CVE
                           <React.Fragment key={idx}>
                             <tr className="border-b border-slate-50 last:border-0">
                               <td className="py-2 text-slate-700 font-medium">{port.port}</td>
@@ -530,7 +679,6 @@ function App() {
                               </td>
                             </tr>
 
-                            {/* --- Sous-ligne d'alerte, uniquement si des CVE existent --- */}
                             {port.cves && port.cves.length > 0 && (
                               <tr className="bg-red-50">
                                 <td colSpan={4} className="px-2 py-2">
@@ -561,6 +709,23 @@ function App() {
                     </table>
                   ) : (
                     <p className="text-sm text-slate-400">Aucun port ouvert détecté.</p>
+                  )}
+
+                  {/* --- Encart des remédiations, si des recommandations existent --- */}
+                  {host.remediations && host.remediations.length > 0 && (
+                    <div className="mt-4 bg-blue-50 border border-blue-100 rounded-lg p-4">
+                      <p className="text-xs font-semibold text-blue-800 mb-2">
+                        💡 Recommandations de sécurité
+                      </p>
+                      <ul className="space-y-1.5">
+                        {host.remediations.map((advice, idx) => (
+                          <li key={idx} className="text-xs text-blue-700 flex gap-1.5">
+                            <span className="text-blue-400">—</span>
+                            <span>{advice}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
                   )}
                 </div>
               ))}

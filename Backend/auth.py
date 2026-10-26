@@ -1,5 +1,6 @@
 # auth.py
 
+import os
 from datetime import datetime, timedelta, timezone
 from passlib.context import CryptContext
 import jwt
@@ -15,7 +16,7 @@ import models
 # --- Configuration JWT ---
 # En production, cette clé DOIT venir d'une variable d'environnement,
 # jamais codée en dur dans le code source versionné.
-SECRET_KEY = "change-moi-en-variable-environnement-avant-la-prod"
+SECRET_KEY = os.getenv("SECRET_KEY", "change-moi-en-variable-environnement-avant-la-prod")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24h, confortable pour du dev/MVP
 

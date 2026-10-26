@@ -1,0 +1,21 @@
+# Framework & serveur
+fastapi
+uvicorn
+
+# Base de données
+sqlalchemy
+
+# Validation de données
+pydantic
+
+# Authentification & sécurité
+passlib
+bcrypt
+python-jose[cryptography]
+python-multipart
+
+# Requêtes HTTP (API NVD pour les CVE)
+requests
+
+# JWT (utilisé via PyJWT dans auth.py)
+PyJWT
